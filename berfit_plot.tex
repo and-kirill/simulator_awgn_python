@@ -1,0 +1,42 @@
+% This is a test script whowing how to visualize berfit.py output using pgfplots package in latex
+\documentclass[tikz, border=0pt]{standalone}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\begin{document}
+\begin{tikzpicture}[cap=round]
+\begin{axis}[
+    width=12cm, height=8cm,
+    % Set up axes names
+    xlabel={$E_s/N_0$, dB},
+    ylabel={Frame error rate},
+    % Set axes limits
+    ymode=log,
+    xmin=-2,    xmax=7,
+    ymin=1e-4, ymax=1,
+    axis line style={latex-latex},
+    label style={font=\scriptsize},
+    tick label style={font=\scriptsize},
+    ylabel style={yshift=-2mm},
+    grid=both,
+    grid style={line width=.1pt, draw=gray!20},
+    major grid style={line width=.2pt,draw=gray!50},
+    tick align=inside,
+    tickpos=left,
+    xtick distance=1.0,
+    minor tick num=4,
+    x tick label style={
+        /pgf/number format/.cd,
+        fixed,
+        fixed zerofill,
+        precision=1
+    }
+]
+\begin{scope}[]
+\addplot[gray, thin, only marks, mark=x, mark size=1pt, error bars/.cd,y explicit,y dir=both] table[x=snr, y=fer, y error minus=fer_e_minus, y error plus = fer_e_plus] {test.txt};
+\addplot[red, thick, smooth, tension=0.5] table[x=snr, y=fer_fit] {test.txt};
+\end{scope}
+\end{axis}
+\end{tikzpicture}
+\end{document}
+
