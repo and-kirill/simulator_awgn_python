@@ -435,7 +435,7 @@ class Simulator:
         # If called before init_pool or if called at worker initialization failure
         except AttributeError:
             pass
-        LOGGER.debug('Simulator destroyed.')
+        LOGGER.info('Pool closed.')
 
     @staticmethod
     def init_pool(experiment):
@@ -523,7 +523,7 @@ class Simulator:
                 Simulator.single_run,  # Function to execute
                 [(snr_db, self.experiment)] * batch_size  # Arguments repeated batch_size times
             )
-            self.update_async(snr_db, stats_array)
+            self.storage.update(stats_array.get(), snr_db)
             elapsed = time.time() - t_start
             LOGGER.info(
                 self.storage.print(snr_db) + f', {elapsed:1.3f}s/{batch_size:1.4e} tests.'
@@ -532,21 +532,6 @@ class Simulator:
             self.interrupted()
         except:  # Pylint W0702: bare-except. Note that the trace is logged here
             self.crashed()
-
-    def update_async(self, snr_db, stats_array, max_count=1000):
-        """
-        Update the storage asynchronously while the batch is being executed
-        :param snr_db: a key to the data storage
-        :param stats_array: result of pool.map_async()
-        :param max_count: force results merge after getting <max_count> items
-        """
-        entries = []
-        for item in stats_array.get():
-            entries.append(item)
-            if len(entries) > max_count:
-                self.storage.update(entries, snr_db)
-                entries = []
-        self.storage.update(entries, snr_db)
 
     # Below are pool termination routines
     def crashed(self):
