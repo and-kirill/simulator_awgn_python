@@ -316,27 +316,26 @@ class DataStorage:
         """
         return self.get_entry(snr_db).experiment_count()
 
-    def stop_criterion(self, snr_id):
+    def stop_criterion(self, snr_db):
         """
         Check simulation stop criterion for a given data entry (single SNR point)
-        :param snr_id: data entry index
+        :param snr_db: data entry key
         :return: True is can stop simulations
         """
-        data_entry = self.entries[snr_id]
+        data_entry = self.entries[snr_db]
         hit_experiment_count = data_entry.experiment_count() > self.max_experiments
         hit_error_count = data_entry.error_count() > self.max_errors
         return hit_experiment_count or hit_error_count
 
-    def terminate_criterion(self, snr_id):
+    def terminate_criterion(self, snr_db):
         """
         Check whether to stop simulations
         :return: True if can stop simulations
         """
-        assert snr_id < len(self.entries)
-        data_entry = self.entries[snr_id]
+        data_entry = self.entries[snr_db]
         if data_entry.experiment_count() == 0:
             return False
-        if not self.stop_criterion(snr_id):
+        if not self.stop_criterion(snr_db):
             return False
         if data_entry.error_prob() < self.min_error_prob:
             return True
