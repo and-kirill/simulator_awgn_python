@@ -51,6 +51,14 @@ The code is assumed to be used as a module. To run demo experiment, proceed thro
     - `max_errors` is a maximum number of errors to be collected. If the specified number of errors has happened, simulator stops evaluating the corresponding SNR point and proceeds to the next one.
     - `max_experiments` is a maximum number of experiments to conduct. If this number is hit before the condition above, simulator will proceed to the next SNR point
     - `min_error_prob` is a minimum probability of error to be simulated. If (after the conditions above satisfied) the probability of error goes below the specified value, simulation stops. Simulator assumes that the probability of error decreases with the SNR increase, and it iterates through the sorted SNR values. Note that some requested SNR points may not be evaluated.
+    - `chunk_size` is the number of single tests to be performed by a worker at once. If not specified, default value is one. If the batch size is too large, data merging may become a bottleneck. This may happen when trying to evaluate very small probability of errors. To improve simulation efficiency, try increasing this parameter.
+    - `look_ahead` allows to schedule multiple batches simultaneously to optimize the CPU usage. Default is 2. See `Scheduler` class in [simulator.py](simulator.py) for more details. If this parameter is grater than zero, then `look_ahead` next SNR points are simulated even if the point under consideration has not captured enough experiments.
+  - To configure postprocessing, specify the following parameters:
+    - `confidence_level` is a confidence level for error-bars
+    - `pe_threshold` is a maximum probability of error to be included in the regression model (values close to one may result in numerical instability)
+    - `max_degree` is a maximum regression degree (in the case of spline regression - a maximum number of reference points)
+    - `max_degree_ratio` is a upper-bound for regression degree if the number pf points is small. Regression degree can not be larger than `N/max_degree_ratio`, where `N` is the number of points simulated
+    - `regression` is a regression type. For the `polynomial` case, a polynomial model (in log-domain) with a Bernoulli loss function is applied. For the `spline` case, a set of adjustable reference points defines a smooth curve. The latter option is better suitable for the case when an error-floor appears.
   - The summarized JSON example is presented below:
 ```json
 {
@@ -63,7 +71,16 @@ The code is assumed to be used as a module. To run demo experiment, proceed thro
     "snr_range": "-5:0.02:10",
     "max_errors": 50,
     "max_experiments": 1e7,
-    "min_error_prob": 1e-4
+    "min_error_prob": 1e-4,
+    "chunk_size": 1,
+    "look_ahead": 2
+  },
+  "postprocessing": {
+    "confidence_level": 0.95,
+    "pe_threshold": 0.95,
+    "max_degree": 15,
+    "max_degree_ratio": 3,
+    "regression": "polynomial"
   }
 }
 ```

@@ -1,9 +1,7 @@
 """
 This module implements all link-level simulation routines:
- - AWGN channel with QAM modulation
  - Parallel execution of experiments
  - Saving and printing the output data
- - Advanced postprocessing with smooth BER curves and confidence intervals
 """
 
 # This file is part of the simulator_awgn_python distribution
@@ -24,20 +22,15 @@ This module implements all link-level simulation routines:
 
 import multiprocessing
 import os
-import time
 import sys
 import signal
 import pickle
 import traceback
 import logging
-import dataclasses
-import pandas as pd
+from enum import IntEnum
+
 import numpy as np
 from numpy.random import SeedSequence, default_rng
-
-from scipy.optimize import minimize
-from scipy.stats import binomtest
-from scipy.special import erfc
 
 from filelock import FileLock
 
@@ -47,119 +40,6 @@ RNG_INSTANCE = None
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-class AwgnQAMChannel:
-    """
-    Initialize the AWGN QAM channel
-    :param modulation: string constant representing the modulation
-                       Supported: 'BPSK', 'QPSK', and 'QAM-16'
-    """
-    def __init__(self, modulation):
-        if modulation.lower() == 'bpsk':
-            self.bps = 1
-            self.avg_energy = 1
-            self.modulate = AwgnQAMChannel.modulate_bpsk
-            self.demodulate = AwgnQAMChannel.demodulate_bpsk
-        elif modulation.lower() == 'qpsk':
-            self.bps = 2
-            self.avg_energy = 2
-            self.modulate = AwgnQAMChannel.modulate_bpsk
-            self.demodulate = AwgnQAMChannel.demodulate_bpsk
-        elif modulation.lower() == 'qam-16':
-            self.bps = 4
-            self.avg_energy = 10
-            self.modulate = AwgnQAMChannel.modulate_pam4
-            self.demodulate = AwgnQAMChannel.demodulate_pam4
-        else:
-            raise NotImplementedError(f'Modulation {modulation} is not supported')
-        self.c_size = 2 ** self.bps  # Constellation size
-
-    def run(self, tx_bits, snr_db, rng):
-        """
-        Perform the modulation and demodulation routines
-        Transform transmitted bits to log-likelihood ratios
-        :param tx_bits: transmitted bits (1D numpy array)
-        :param snr_db: signal to noise ratio (dB)
-        :param rng: Random number generator instance (required by correct multiprocess randomness)
-        :return: Log likelihood ratio vector of the same size as transmitted bits
-        """
-        # Modulation
-        tx_symb = self.modulate(tx_bits)
-
-        # Noise
-        snr_lin = AwgnQAMChannel.db_to_linear(snr_db)
-        sigma_noise = np.sqrt(self.avg_energy) / np.sqrt(snr_lin) / np.sqrt(2)
-        noise_vec = sigma_noise * rng.standard_normal(size=tx_symb.shape)
-
-        # Demodulation
-        llr_channel = self.demodulate(tx_symb + noise_vec, sigma_noise ** 2)
-
-        # Output statistics
-        cwd_hat = (llr_channel < 0).reshape(-1, self.bps)
-        ber = np.mean((llr_channel < 0) != tx_bits)
-        ser = np.mean(np.sum(tx_bits.reshape(-1, self.bps) != cwd_hat, axis=1) != 0)
-
-        return llr_channel, ber, ser
-
-    def get_ber(self, snr_db):
-        """
-        Get theoretical BER value
-        """
-        ebno_linear = AwgnQAMChannel.db_to_linear(snr_db) / self.bps
-        if self.bps == 1:  # BPSK
-            return erfc(np.sqrt(ebno_linear)) / 2
-
-        erfc_arg = np.sqrt(3 * self.bps * ebno_linear / (self.c_size - 1) / 2)
-        erfc_scale = 2 * (1 - 1 / np.sqrt(self.c_size)) / self.bps
-        return erfc_scale * erfc(erfc_arg)
-
-    @staticmethod
-    def modulate_bpsk(tx_bits: np.array) -> np.array:
-        """
-        BPSK modulation. Note that Gray-coded QPSK can be considered
-        as two independent (over I and Q channels) BPSK modulations
-        """
-        # Convert uint8 bits to double
-        return 1 - 2 * tx_bits.astype(np.double)
-
-    @staticmethod
-    def modulate_pam4(tx_bits: np.array) -> np.array:
-        """
-        Gray-coded PAM-4 modulation. Note that Gray-coded QAM-16 can be considered
-        as two independent (over I and Q channels) PAM-4 modulations
-        """
-        # Convert uint8 bits to double
-        tx_bits_stacked = tx_bits.reshape(-1, 2).astype(np.double)
-        tx_seq = 2 * AwgnQAMChannel.modulate_bpsk(tx_bits_stacked[:, 0])
-        tx_seq += np.sign(tx_seq) * AwgnQAMChannel.modulate_bpsk(tx_bits_stacked[:, 1])
-        return tx_seq
-
-    @staticmethod
-    def demodulate_bpsk(rx_symb, noise_power):
-        """
-        Demodulate BPSK sequence
-        """
-        return 2 * rx_symb / noise_power
-
-    @staticmethod
-    def demodulate_pam4(rx_symb, noise_power):
-        """
-        Demodulate Gray-coded PAM-4 sequence
-        """
-        llr_bpsk = AwgnQAMChannel.demodulate_bpsk(rx_symb, noise_power)
-        offset = -4 / noise_power
-        return np.vstack([
-            llr_bpsk + np.log((1 + np.exp(offset + llr_bpsk)) / (1 + np.exp(offset - llr_bpsk))),
-            llr_bpsk + offset + np.log((1 + np.exp(-3 * llr_bpsk)) / (1 + np.exp(-llr_bpsk)))
-        ]).T.reshape(-1)
-
-    @staticmethod
-    def db_to_linear(val_db):
-        """
-        Convert logarithmic to linear scale
-        """
-        return 10 ** (val_db / 10)
 
 
 class DataEntry:
@@ -310,36 +190,26 @@ class DataStorage:
         """
         self.get_entry(snr_db).merge(results)
 
-    def experiment_count(self, snr_db):
+    def scheduling_info(self, snr_db):
         """
-        Get experiment count for corresponding data entry (single SNR point)
+        Interface to scheduler
         """
-        return self.get_entry(snr_db).experiment_count()
-
-    def stop_criterion(self, snr_db):
-        """
-        Check simulation stop criterion for a given data entry (single SNR point)
-        :param snr_db: data entry key
-        :return: True is can stop simulations
-        """
-        data_entry = self.entries[snr_db]
-        hit_experiment_count = data_entry.experiment_count() > self.max_experiments
-        hit_error_count = data_entry.error_count() > self.max_errors
-        return hit_experiment_count or hit_error_count
-
-    def terminate_criterion(self, snr_db):
-        """
-        Check whether to stop simulations
-        :return: True if can stop simulations
-        """
-        data_entry = self.entries[snr_db]
-        if data_entry.experiment_count() == 0:
-            return False
-        if not self.stop_criterion(snr_db):
-            return False
-        if data_entry.error_prob() < self.min_error_prob:
-            return True
-        return False
+        if snr_db not in self.entries:
+            entry = self.data_type()
+        else:
+            entry = self.get_entry(snr_db)
+        hit_experiment_count = entry.experiment_count() > self.max_experiments
+        hit_error_count = entry.error_count() > self.max_errors
+        return {
+            # Entry us complete if required number of errors has been captured
+            'is_complete': hit_experiment_count or hit_error_count,
+            # Entry hits error probability criterion if this probability is below a required value
+            'error_prob_criterion': entry.error_prob() < self.min_error_prob,
+            # Error count (required for scheduler to choose an entry with minimum error count)
+            'error_count': entry.error_count(),
+            # Error probability (required to estimate the batch size)
+            'error_prob': entry.error_prob()
+        }
 
     def print(self, snr_db):
         """
@@ -397,6 +267,168 @@ class DataStorage:
         return entry
 
 
+class Scheduler:
+    """
+    Implements a scheduling algorithm:
+     - selects a batch size
+     - Selects a set of points requiring additional experiments
+     - Suggests a next batch ( SNR point and the number of tests) to simulate
+     Scheduler assumes that the requested SNR points are sorted in increasing order, and
+     the probability of error to be estimated does not increase when the SNR increases
+    """
+
+    class State(IntEnum):
+        """
+        Each requested SNR point has one of the following states:
+        """
+        # IDLE: The SNR point is not considered by scheduler. The reasons are
+        #  - error probability is below a minimum requested value
+        #  - no experiments were conducted for this point
+        #  - the SNR point is too far from points that are currently evaluated
+        IDLE = 0
+        # PENDING: SNR point requites more experiments if
+        #  - some number of experiments has been conducted
+        #  - error probability is higher than a threshold
+        #  - the number of errors is smaller than required
+        #  - SNR point is not further than 'look_ahead' points (SNR points are sorted) from
+        #    the last SNR point for which the probability of error is above the threshold
+        #  - There are no IDLE points before any PENDING/COMPLETE point
+        PENDING = 1    # SNR point is considered by scheduler and requires more experiments
+        SCHEDULED = 2  # The SNR point is being evaluated by parallel pool
+        COMPLETE = 3   # Sufficient number of errors has been collected
+
+    class Entry:
+        """
+        Scheduling entry. Tracks the state of each SNR point
+        """
+        def __init__(self, errors_per_batch, chunk_size, **kwargs):
+            is_complete = get_required_argument('is_complete', **kwargs)
+            error_prob_criterion = get_required_argument('error_prob_criterion', **kwargs)
+            if is_complete:
+                self.state = Scheduler.State.COMPLETE
+            elif error_prob_criterion:
+                self.state = Scheduler.State.IDLE
+            else:
+                self.state = Scheduler.State.PENDING
+            # Indicator whether a minimum probability of error was achieved
+            self.hit_minimum_pe = error_prob_criterion
+            # Error count required to make a scheduling decision.
+            # The entry with a minimum error count is scheduled first
+            self.error_count = get_required_argument('error_count', **kwargs)
+            # Batch size (estimated in accordance with probability of error)
+            n_cpu = multiprocessing.cpu_count()
+            self.batch_size = n_cpu
+            if self.error_count > 0:
+                error_prob = get_required_argument('error_prob', **kwargs)
+                scale = int(np.ceil(errors_per_batch / error_prob / chunk_size / n_cpu))
+                self.batch_size = scale * n_cpu
+
+        def print(self):
+            """
+            Nice print
+            """
+            if self.state == Scheduler.State.IDLE:
+                state_str = 'IDLE'
+            elif self.state == Scheduler.State.PENDING:
+                state_str = 'PEND'
+            else:
+                state_str = 'DONE'
+            min_error_prob_str = 'yes' if self.hit_minimum_pe else 'no '
+            return f'State: {state_str}, ' +\
+                f'Achieved min_error_prob: {min_error_prob_str}, ' +\
+                f'{self.error_count} errors, batch size = {self.batch_size}'
+
+        def __str__(self):
+            return self.print()
+
+    def __init__(self, **kwargs):
+        self.errors_per_batch = get_required_argument('errors_per_batch', **kwargs)
+        self.chunk_size = get_required_argument('chunk_size', **kwargs)
+        self.look_ahead = get_required_argument('look_ahead', **kwargs)
+
+        self.snr_range = []
+        self.entries = []
+
+    def init(self, storage, snr_range):
+        """
+        Initialize the schedule
+        """
+        self.snr_range = snr_range
+        for snr_db in snr_range:
+            self.entries.append(self.Entry(
+                self.errors_per_batch,
+                self.chunk_size,
+                **storage.scheduling_info(snr_db)
+            ))
+        self.__update_batch_size()
+        self.__update_pending()
+
+    def pending_count(self):
+        """
+        Get the number of entries having PENDING state
+        """
+        states = np.array([entry.state for entry in self.entries])
+        return np.sum(states == self.State.PENDING)
+
+    def incomplete(self):
+        """
+        Return true if more experiments required
+        """
+        states = np.array([entry.state for entry in self.entries])
+        return np.sum(states == self.State.SCHEDULED) + self.pending_count() > 0
+
+    def notify_batch(self, snr_index, entry_kwargs):
+        """
+        Notify that batch has been evaluated.
+        """
+        # Notify batch started:
+        self.entries[snr_index] = self.Entry(
+            self.errors_per_batch,
+            self.chunk_size,
+            **entry_kwargs
+        )
+        self.__update_batch_size()
+        self.__update_pending()
+
+    def request_batch(self):
+        """
+        A batch has been req
+        """
+        states = np.array([entry.state for entry in self.entries])
+        error_count = np.array([entry.error_count for entry in self.entries])
+        idx_pending = np.argwhere(states == self.State.PENDING).reshape(-1)
+        if len(idx_pending) == 0:
+            return None, 0
+        id_schedule = idx_pending[np.argmin(error_count[idx_pending])]
+        self.entries[id_schedule].state = self.State.SCHEDULED
+        return id_schedule, int(self.entries[id_schedule].batch_size)
+
+    def __update_batch_size(self):
+        """
+        Batch sizes is a non-decreasing sequence.
+        Set batch size as a maximum among all previous values and a current vlaue
+        """
+        max_batch_size = 0
+        for i, _ in enumerate(self.snr_range):
+            max_batch_size = max(self.entries[i].batch_size, max_batch_size)
+            self.entries[i].batch_size = max_batch_size
+
+    def __update_pending(self):
+        """
+        Enforces the following rules:
+         - SNR point is PENDING if it is not further than 'look_ahead' points from
+           the last SNR point for which the probability of error is above the threshold
+         - There are no IDLE points before any PENDING/COMPLETE point
+        """
+        states = np.array([entry.state for entry in self.entries])
+        hit_error_prob = np.array([entry.hit_minimum_pe for entry in self.entries])
+        last_incomplete = np.max(np.argwhere(hit_error_prob == 0), initial=0) + self.look_ahead
+        idx_idle = np.argwhere(states == self.State.IDLE)
+        idx_idle = idx_idle[idx_idle <= last_incomplete]
+        for i in idx_idle:
+            self.entries[i].state = self.State.PENDING
+
+
 class Simulator:
     """
     Implements parallel execution of multiple independent tests
@@ -414,6 +446,7 @@ class Simulator:
 
         # Class handling single test execution. Methods run() and init_worker() must be implemented
         self.experiment = experiment
+        LOGGER.info('Creating simulator of %s.', self.experiment.get_title())
 
         # Initialize pool of workers
         # Triggers pylint R1732: Consider using 'with' for resource-allocating operations
@@ -427,6 +460,7 @@ class Simulator:
 
         # SNR values will be rounded up <snr-precision> digits after floating point
         self.snr_precision = kwargs.get('snr_precision', 3)
+        # Scheduler-related variables
 
     def __del__(self):
         try:
@@ -448,11 +482,15 @@ class Simulator:
         report_queue = multiprocessing.Queue()
         for rng in SeedSequence().spawn(n_workers):
             rng_queue.put(rng)
-
+        if hasattr(experiment, 'init_worker_args'):
+            LOGGER.info('Experiment requires initial arguments.')
+            initargs = rng_queue, report_queue, experiment, experiment.init_worker_args()
+        else:
+            initargs = rng_queue, report_queue, experiment
         pool = multiprocessing.Pool(
             processes=n_workers,
             initializer=Simulator.init_worker,
-            initargs=(rng_queue, report_queue, experiment)
+            initargs=initargs
         )
         rng_queue.close()
         # Try not returning non-initialized pool.
@@ -473,6 +511,19 @@ class Simulator:
 
     def run(self, **kwargs):
         """
+        Main loop wrapped into KeybardInterrupt catcher.
+        If any other exception happens, dump file will be created.
+        """
+        try:
+            self.__run(**kwargs)
+        except KeyboardInterrupt:
+            LOGGER.info('Pool interrupted.')
+            self.interrupted()
+        except:  # Pylint W0702: bare-except. Note that the trace is logged here
+            self.crashed()
+
+    def __run(self, **kwargs):
+        """
         Main loop
         """
         # Parse input arguments
@@ -482,55 +533,59 @@ class Simulator:
                 self.snr_precision  # Merge SNR points close to each other and sort them
             )
         )
-        batch_size = get_required_argument('batch_size', **kwargs)
-        max_errors = get_required_argument('max_errors', **kwargs)
-        max_experiments = get_required_argument('max_experiments', **kwargs)
-        min_error_prob = get_required_argument('min_error_prob', **kwargs)
-
         # Error rate is assumed to decrease with the SNR increase
-        self.storage.set_sim_params(max_errors, max_experiments, min_error_prob)
-        for snr_db in snr_range:
-            self.simulate_snr(snr_db, batch_size)
-            # Check the termination condition
-            if self.storage.terminate_criterion(snr_db):
-                break
+        min_error_prob = get_required_argument('min_error_prob', **kwargs)
+        self.storage.set_sim_params(
+            get_required_argument('max_errors', **kwargs),
+            get_required_argument('max_experiments', **kwargs),
+            min_error_prob
+        )
+        # Arguments allowing default values:
+        chunk_size = kwargs.get('chunk_size', 1)
+        look_ahead = kwargs.get('look_ahead', 2)
+        errors_per_batch = kwargs.get('errors_per_batch', 10)
 
-    def simulate_snr(self, snr_db, batch_size):
-        """
-        Simulate single SNR point
-        """
-        # Run batches if needed
-        LOGGER.debug('Simulating SNR %1.3f.', snr_db)
-        LOGGER.debug(self.storage.print(snr_db))
-        n_experiments = self.storage.experiment_count(snr_db)
-        while not self.storage.stop_criterion(snr_db):
-            LOGGER.debug('Requested batch size %d', batch_size)
-            self.run_batch(snr_db, batch_size)
-            self.storage.save()
-        # Save data after each SNR point (only if experiment count updated)
-        if n_experiments < self.storage.experiment_count(snr_db):
-            self.storage.save()
-
-    def run_batch(self, snr_db, batch_size):
-        """
-        Run single batch for given SNR index
-        """
-        try:
-            t_start = time.time()
-            # Use map_async. Otherwise, merging the results may become a bottleneck
-            stats_array = self.pool.map_async(
-                Simulator.single_run,  # Function to execute
-                [(snr_db, self.experiment)] * batch_size  # Arguments repeated batch_size times
-            )
-            self.storage.update(stats_array.get(), snr_db)
-            elapsed = time.time() - t_start
+        scheduler = Scheduler(
+            max_errors=get_required_argument('max_errors', **kwargs),
+            errors_per_batch=errors_per_batch,
+            chunk_size=chunk_size,
+            min_error_prob=min_error_prob,
+            look_ahead=look_ahead
+        )
+        # Run simulations
+        scheduler.init(self.storage, snr_range)
+        scheduled_items = []
+        while scheduler.incomplete():
+            if len(scheduled_items) > look_ahead or scheduler.pending_count() == 0:
+                # Collect data
+                snr_index, async_result = scheduled_items.pop(0)
+                snr_db = snr_range[snr_index]
+                self.storage.update(async_result.get(), snr_db)
+                LOGGER.info(self.storage.print(snr_db))
+                self.storage.save()
+                # Notify scheduler
+                scheduler.notify_batch(snr_index, self.storage.scheduling_info(snr_db))
+            snr_index, batch_size = scheduler.request_batch()
+            if snr_index is None:
+                continue
             LOGGER.info(
-                self.storage.print(snr_db) + f', {elapsed:1.3f}s/{batch_size:1.4e} tests.'
+                'Schedule SNR %2.2f. Batch size %1.4e (%1.4e X %1.4e)',
+                snr_range[snr_index],
+                batch_size * chunk_size, batch_size, chunk_size
             )
-        except KeyboardInterrupt:
-            self.interrupted()
-        except:  # Pylint W0702: bare-except. Note that the trace is logged here
-            self.crashed()
+            scheduled_items.append((
+                snr_index,
+                self.schedule_batch(snr_range[snr_index], int(batch_size), chunk_size)
+            ))
+
+    def schedule_batch(self, snr_db, batch_size, chunk_size):
+        """
+        Run single batch for given SNR value. Return multiprocessing async result
+        """
+        return self.pool.map_async(
+            Simulator.single_run,
+            [(snr_db, self.experiment, chunk_size)] * batch_size
+        )
 
     # Below are pool termination routines
     def crashed(self):
@@ -586,17 +641,22 @@ class Simulator:
         In the case of crash, stacktrace will be written to file
         :param args: required arguments tuple
         """
-        snr_db, experiment = args
+        snr_db, experiment, chunk_size = args
         # Use per-process global random state here (see init_pool)
-        return experiment.run(snr_db, RNG_INSTANCE)
+        entry = experiment.run(snr_db, RNG_INSTANCE)
+        if chunk_size > 1:
+            data = [experiment.run(snr_db, RNG_INSTANCE) for _ in range(chunk_size - 1)]
+            entry.merge(data)
+        return entry
 
     @staticmethod
-    def init_worker(rng_queue, report_queue, experiment):
+    def init_worker(rng_queue, report_queue, experiment, experiment_args=None):
         """
         Initialize pool worker
         :param rng_queue: Multiprocessing queue with seed list
         :param report_queue: Put init worker status (success or failure)
         :param experiment: Experiment class instance, see Simulator.init_pool()
+        :param experiment_args: Experiment init_worker() arguments (e.g., a shared memory)
         :return: None, just updates all global per-process variables
         """
         # Disable response to keyboard interrupt within sub-processes:
@@ -613,266 +673,15 @@ class Simulator:
             # Silently exit in this case
             sys.exit(1)
         try:
-            experiment.init_worker()
+            if experiment_args is not None:
+                experiment.init_worker(experiment_args)
+            else:
+                experiment.init_worker()
             report_queue.put(True)
         except:  # PEP-8: bare exception. Note that at his moment the exception is logged
             write_stacktrace(f'worker_{os.getpid()}_init_crash.txt')
             report_queue.put(False)
         report_queue.close()
-
-
-@dataclasses.dataclass
-class PostprocessingParameters:
-    """
-    Postprocessing parameters like confidence intervlas, maximum regression degree, etc
-    """
-    # Confidence level for error bars
-    confidence_level: float
-    # Bernoulli's regression parameters
-    # Ignore points above this probability of error
-    # Starting from the lowest SNR, find the last point with probability of error
-    # above this threshold and ignore all previous data
-    pe_threshold: float
-    # Maximum regression degree
-    max_degree: float
-    # Maximum degree should not exceed a fixed portion of points collected
-    max_degree_ratio: float
-
-
-class PostProcessing:
-    """
-    Generate text/pandas data frame outputs from raw simulation results
-    """
-    def __init__(self, **kwargs):
-        # Parameters without default values
-        self.modulation = kwargs.get('modulation')  # Channel modulation
-        self.filename = kwargs.get('filename')
-
-        # Parameters not subject to change
-        # Confidence level for error bars
-        self.params = PostprocessingParameters(
-            confidence_level=kwargs.get('confidence_level', 0.95),
-            pe_threshold=kwargs.get('pe_threshold', 0.96),
-            max_degree=kwargs.get('max_degree', 15),
-            max_degree_ratio=kwargs.get('max_degree_ratio', 3)
-        )
-        # Data update lock
-        self.update_lock = multiprocessing.Lock()
-        # Cached data access lock
-        self.cache_lock = multiprocessing.Lock()
-
-        # Cached data
-        self.pickle_cache = {}
-        self.data = None
-        # Try to load data immediately
-        self.get()
-
-    def get(self):
-        """
-        Get the up-to-date pandas data frame.
-        This data-frame will also be saved to txt file.
-        """
-        if not os.path.isfile(self.filename):
-            self.__reset()
-            return None
-
-        txt_file = os.path.splitext(self.filename)[0] + '.txt'
-        if os.path.isfile(txt_file):
-            pickle_updated = os.path.getmtime(txt_file) < os.path.getmtime(self.filename)
-            if not (pickle_updated or self.data is None):
-                return self.__data_get()
-
-        if self.update_lock.acquire(block=False):
-            # Update cached data
-            self.__update_pickle_cache()
-            # Generate dataframe from the cached data
-            data = self.__get_dataframe()
-            self.update_lock.release()
-            self.__data_set(data)
-            return data
-
-        # Lock was not acquired. Parallel postprocessing in progress. Return data as is.
-        return self.__data_get()
-
-    def __reset(self):
-        """
-        Reset cache and remove post-processed text file
-        """
-        with self.update_lock:
-            self.pickle_cache = {}
-
-        txt_file = os.path.splitext(self.filename)[0] + '.txt'
-        with self.cache_lock:
-            os.system(f'rm -f {txt_file}')
-            self.data = None
-
-    def __data_get(self) -> pd.DataFrame:
-        """
-        Get data with lock
-        """
-        with self.cache_lock:
-            return self.data
-
-    def __data_set(self, data):
-        """
-        Save data to file (with lock)
-        """
-        txt_file = os.path.splitext(self.filename)[0] + '.txt'
-        with self.cache_lock:
-            data.to_csv(txt_file, sep=' ', float_format='%1.6e', index=False)
-            # Save dataframe for fast-return if pickle file was not changed
-            self.data = data
-
-    def __update_pickle_cache(self):
-        """
-        Load pickle and update cache
-        """
-        data_pickle = load_pickle(self.filename)
-        # Update pickle cache: re-evaluate confidence intervals for updated entries
-        for snr, entry in data_pickle.items():
-            if entry['n_exp'] == 0:
-                continue
-            if snr not in self.pickle_cache or entry['n_exp'] != self.pickle_cache[snr]['n_exp']:
-                self.pickle_cache[snr] = data_pickle[snr]
-                # Error bars it the most expensive postprocessing procedure.
-                # Do it only if the data was updated
-                pe_minus, pe_plus = self.bernoulli_confidence(
-                    entry['out_fer'],  # Number of errors
-                    entry['n_exp']  # Number of tests
-                )
-                self.pickle_cache[snr]['fer_e_minus'] = pe_minus
-                self.pickle_cache[snr]['fer_e_plus'] = pe_plus
-        # Sort pickle cache by SNR
-        self.pickle_cache = dict(sorted(self.pickle_cache.items()))
-
-    def __get_dataframe(self):
-        """
-        Generate pandas Data Frame from cached data
-        """
-        entries = list(self.pickle_cache.values())
-        snr_range = np.array([float(k) for k in list(self.pickle_cache.keys())])
-        n_tests = np.array([e['n_exp'] for e in entries])
-        fer_cum = np.array([e['out_fer'] for e in entries])
-        ber_cum = np.array([e['out_ber'] for e in entries])
-
-        # Create Pandas dataframe
-        data = pd.DataFrame()
-        # Signal-to-noise ratio range
-        data['snr'] = snr_range
-        # Generate frame error rate outputs with error bars
-        data['fer'] = np.array([e['out_fer'] / e['n_exp'] for e in entries])
-        data['fer_e_minus'] = np.array([e['fer_e_minus'] for e in entries])
-        data['fer_e_plus'] = np.array([e['fer_e_plus'] for e in entries])
-        data['fer_fit'] = self.get_bernoulli_fit(snr_range, fer_cum, n_tests)
-
-        data['ber'] = np.array([e['out_ber'] / e['n_exp'] for e in entries])
-        # Typically, errors in individual bits may be dependent.
-        # Thus:
-        # 1. One can generate fit without exact number of bits and
-        #    use down-scaled values by the number of bits per single test
-        # 2. Bit error rate confidence intervals may be useless
-        data['ber_fit'] = self.get_bernoulli_fit(snr_range, ber_cum, n_tests)
-
-        data['in_ber'] = np.array([e['in_ber'] / e['n_exp'] for e in entries])
-        # Add theoretical BER values to immediately detect any bug from plots
-        data['in_ber_ref'] = AwgnQAMChannel(self.modulation).get_ber(data['snr'].to_numpy())
-
-        return data
-
-    def bernoulli_confidence(self, n_errors: float, n_tests: int):
-        """
-        Calculate upper and lower confidence intervals for Bernoulli random variable
-        """
-        p_err = n_errors / n_tests
-        result = binomtest(k=np.int64(np.round(n_errors)), n=n_tests, p=p_err)
-        conf_interval = result.proportion_ci(
-            confidence_level=self.params.confidence_level,
-            method='wilson'  # Do not use 'exact' method when the number of tests is large
-        )
-        return p_err - conf_interval.low, conf_interval.high - p_err  # Error 'minus', error 'plus'
-
-    def get_bernoulli_fit(self, snr_range: np.array, n_errors: np.array, n_tests: np.array):
-        """
-        Try multiple get_bernoulli_fit attempts with different degrees of freedom and
-        output the best fit in terms of resulting loss
-        :param snr_range        SNR points
-        :param n_errors         The number of errors
-        :param n_tests          The number of tests conducted
-        """
-        pe_raw = n_errors / n_tests
-
-        # Skip points with error probabilities close to one
-
-        idx_skip = np.argwhere(pe_raw > self.params.pe_threshold)
-        skip_indx = 0
-        if len(idx_skip):
-            skip_indx = np.max(idx_skip) + 1
-
-        if len(snr_range[skip_indx:]) < self.params.max_degree_ratio:
-            return pe_raw
-        # Estimate degree: minimum between requested degrees and a fraction of collected points
-        degree = min(
-            self.params.max_degree + 1,
-            np.int32(np.round(len(snr_range) / self.params.max_degree_ratio))
-        )
-        # Perform fit
-        pe_raw[skip_indx:] = BerFit(
-            snr_range[skip_indx:],  # SNR points
-            n_errors[skip_indx:],  # The number of errors
-            n_tests[skip_indx:],  # The number of experiments
-            degree  # Regression degree
-        ).fit()[0]
-        return pe_raw
-
-
-class BerFit:
-    """
-    Generate smooth bit error rate curves based on the linear regression with
-    Bernoulli likelihood loss function for selected regression degree
-    """
-    def __init__(self, snr_range, n_errors, n_tests, fit_degree):
-        # Normalize the SNR range
-        snr_span = np.max(snr_range) - np.min(snr_range)
-        self.snr_normalized = (snr_range - np.min(snr_range)) / snr_span
-        # Save number of success and errors
-        self.errors = n_errors
-        self.success = n_tests - n_errors
-        self.n_tests = n_tests
-        # Generate feature matrix
-        self.feature_matrix = np.vstack([self.snr_normalized ** i for i in range(fit_degree + 1)]).T
-
-    def fit(self, init_variance=0.01):
-        """
-        Apply a linear regression on log(p) with Bernoulli loss function
-        """
-        # Suppress 'divide by zero encountered in _binom_cdf'
-        np.seterr(divide='ignore')
-        features = np.hstack([
-            -1,  # Zero-order coefficient must be negative to avoid infinite loss value
-            init_variance * np.random.normal(size=self.feature_matrix.shape[1] - 1)
-        ])
-        sol = minimize(self.loss, features, jac=self.jac, method='Newton-CG')
-        return np.exp(self.feature_matrix @ sol.x), sol.fun
-
-    def loss(self, features):
-        """
-        Bernoulli-loss function is p^k * (1 - p) ^ (n - k) * binom(n, k)
-        Note that binom (n, k) does not change as the dataset is fixed, one can ignore it
-        return: negative log-likelihood
-        """
-        log_pe = self.feature_matrix @ features
-        if np.sum(log_pe > 0):
-            return np.inf
-        # Calculate log(1 - p) given log(p)
-        log_p1 = np.log1p(-np.exp(log_pe))
-        return -np.sum(self.errors * log_pe + self.success * log_p1)
-
-    def jac(self, features):
-        """
-        Loss function gradient
-        """
-        p_err = np.exp(self.feature_matrix @ features)
-        return ((self.n_tests * p_err - self.errors) / (1 - p_err)) @ self.feature_matrix
 
 
 # Below are tool-functions

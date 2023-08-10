@@ -30,7 +30,8 @@ from functools import partial
 import multiprocessing as mp
 import numpy as np
 
-from .simulator import DataEntry, DataStorage, Simulator, PostProcessing
+from .simulator import DataEntry, DataStorage, Simulator
+from .postprocessing import PostProcessing
 from .live_plot import PlotServer
 
 
@@ -94,70 +95,22 @@ def enable_log(name, level=logging.DEBUG, filename=None):
     logger.addHandler(handler)
 
 
-def get_batch_size(target_val):
-    """
-    Get batch size as integer number of available CPUs
-    """
-    cpu_count = mp.cpu_count()
-    return np.ceil(target_val / float(cpu_count)).astype(np.int32) * cpu_count
-
-
-def sim_adaptive_batch(simulator, snr_range, **kwargs):
-    """
-    Run simulations with gradually increasing batch size
-    """
-    max_errors = kwargs.pop('max_errors', 100)
-    min_error_prob = kwargs.pop('min_error_prob', 1e-4)
-    max_experiments = kwargs.pop('max_experiments', 1e7)
-    target_batch_count = kwargs.pop('target_batch_count', 5)
-
-    batch_size = get_batch_size(max_errors)
-    for snr_db in np.round(range_from_string(snr_range), simulator.snr_precision):
-        simulator.run(
-            snr_range=[snr_db],
-            batch_size=batch_size,
-            max_errors=max_errors,
-            max_experiments=max_experiments,
-            min_error_prob=min_error_prob)
-        # Use round to get the correct SNR value
-        data_entry = simulator.storage.get_entry(snr_db)
-        if data_entry.error_prob() < min_error_prob:
-            # Simulator does not take control over termination criterion, check it manually
-            LOGGER.info(
-                'Minimum error probability %1.1e achieved. Captured at least %d errors.',
-                min_error_prob, max_errors
-            )
-            break
-        n_experiments = data_entry.experiment_count()
-        batch_size = get_batch_size(n_experiments / target_batch_count)
-
-
-def sim_adaptive_scan(simulator, snr_range, max_errors, **kwargs):
-    """
-    Run simulations with gradually increasing error count
-    """
-    error_count_step = kwargs.pop('error_count_step', 10)
-    error_limit = 1
-
-    while True:
-        sim_adaptive_batch(simulator, snr_range, max_errors=error_limit, **kwargs)
-        if error_limit > max_errors:
-            return
-        error_limit += error_count_step
-
-
 def load_config():
     """
     Parse command line arguments and load configuration file
     """
-    parser = argparse.ArgumentParser(description='Simulate LDPC codes')
+    parser = argparse.ArgumentParser(description='Simulate error-correcting codes')
     parser.add_argument('--config', help='Filename with simulation parameters')
     args = parser.parse_args()
     if not os.path.isfile(args.config):
         print('Configuration file not found.')
         sys.exit(0)
     with open(args.config, 'r', encoding='utf-8') as file_desc:
-        return json.load(file_desc)
+        try:
+            return json.load(file_desc)
+        except json.decoder.JSONDecodeError:
+            print('Invalid JSON format')
+            sys.exit(1)
 
 
 def expand_experiment_parameters(exp_params: dict):
@@ -184,7 +137,7 @@ def expand_experiment_parameters(exp_params: dict):
     return all_experiments
 
 
-def simulate(experiment, snr_range, max_errors, min_error_prob, max_experiments):
+def simulate(experiment, snr_range, **kwargs):
     """
     Run simulations
     """
@@ -193,14 +146,9 @@ def simulate(experiment, snr_range, max_errors, min_error_prob, max_experiments)
         experiment.get_filename()
     )
     simulator = Simulator(storage=sim_data, experiment=experiment)
-    # Add adaptive batch option (for long experiments)
-    sim_adaptive_scan(
-        simulator,
-        snr_range=snr_range,
-        max_errors=max_errors,
-        min_error_prob=min_error_prob,
-        max_experiments=max_experiments
-    )
+    # Add SNR range to run() method in addition to parameters loaded from config
+    kwargs['snr_range'] = range_from_string(snr_range)
+    simulator.run(**kwargs)
     simulator.close()
 
 
@@ -213,11 +161,13 @@ def run_plot_server(filename, modulation, **kwargs):
     port = kwargs.get('port')
     title = kwargs.get('title')
     server_logfile = kwargs.get('server_logfile', 'plot_server.log')
+    postproc_params = kwargs.get('postprocessing', {})
 
     with open(server_logfile, 'a', encoding='utf-8') as sys.stdout:
         postproc_instance = PostProcessing(
                 filename=filename,
-                modulation=modulation
+                modulation=modulation,
+                **postproc_params
         )
         PlotServer(
             ip_address=address,
@@ -234,6 +184,12 @@ def run_all_experiments(get_experiment_fcn, address='127.0.0.1', start_port=8888
     """
     # Load and expand configuration file
     sim_params = load_config()
+    if 'experiment' not in sim_params:
+        raise ValueError('Wrong configuration: missing experiment description')
+    if 'simulation' not in sim_params:
+        raise ValueError('Wrong configuration: missing simulation setup description')
+
+    postproc_params = sim_params['postprocessing'] if 'postprocessing' in sim_params else {}
     all_experiments = expand_experiment_parameters(sim_params['experiment'])
     # Enable log for tool-scripts
     enable_log('simulator_awgn_python.tools')
@@ -250,7 +206,8 @@ def run_all_experiments(get_experiment_fcn, address='127.0.0.1', start_port=8888
             address=address,
             port=start_port + i,
             update_ms=update_ms,
-            title=exp_instance.get_title()
+            title=exp_instance.get_title(),
+            postprocessing=postproc_params
         )
         plot_process = mp.Process(
             target=server_start_fcn,

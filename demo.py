@@ -22,7 +22,8 @@ Usage (from .. directory): python3 -m simulator_awgn_python.demo
 import logging
 import numpy as np
 
-from .simulator import DataEntry, AwgnQAMChannel
+from .simulator import DataEntry
+from .channel import AwgnQAMChannel
 from .tools import run_all_experiments, enable_log
 
 
