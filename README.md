@@ -98,4 +98,6 @@ This module was tested in Python 3.8 under UNIX OS with the following packages i
 * Scientific python [scipy](https://scipy.org) for postprocessing and AWGN channel
 * [plotly](https://plotly.com) and [dash](https://pypi.org/project/dash/) for live-plots
 * [pandas](https://pandas.pydata.org) for postprocessing
+* [filelock](https://pypi.org/project/filelock/) to lock pickle data file when simultaneously reading/writing to it
+
 To test the AWGN channel, run the test [script](test_awgn_channel.py) that requires [scikit-commpy](https://pypi.org/project/scikit-commpy/). Note that the latter is considerably slower.
