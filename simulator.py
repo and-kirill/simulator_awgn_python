@@ -517,7 +517,7 @@ class Simulator:
         try:
             self.__run(**kwargs)
         except KeyboardInterrupt:
-            LOGGER.info('Pool interrupted.')
+            LOGGER.critical('Pool interrupted.')
             self.interrupted()
         except:  # Pylint W0702: bare-except. Note that the trace is logged here
             self.crashed()
@@ -600,7 +600,7 @@ class Simulator:
         Routines to handle KeyboardInterrupt during pool.map execution
         """
         try:
-            LOGGER.critical('Try to terminate pool. Press Ctrl+C if stuck.')
+            LOGGER.critical('Terminating the pool. Press Ctrl+C if stuck.')
             self.pool.terminate()
         except KeyboardInterrupt:
             self.terminate_agressive()

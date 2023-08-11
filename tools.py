@@ -35,9 +35,6 @@ from .postprocessing import PostProcessing
 from .live_plot import PlotServer
 
 
-LOGGER = logging.getLogger(__name__)
-
-
 def str2num(strnum):
     """
     Try to get integer or float from string
@@ -160,22 +157,20 @@ def run_plot_server(filename, modulation, **kwargs):
     update_ms = kwargs.get('update_ms')
     port = kwargs.get('port')
     title = kwargs.get('title')
-    server_logfile = kwargs.get('server_logfile', 'plot_server.log')
+    # server_logfile = kwargs.get('server_logfile', 'plot_server.log')
     postproc_params = kwargs.get('postprocessing', {})
-
-    with open(server_logfile, 'a', encoding='utf-8') as sys.stdout:
-        postproc_instance = PostProcessing(
-                filename=filename,
-                modulation=modulation,
-                **postproc_params
-        )
-        PlotServer(
-            ip_address=address,
-            port=port,
-            update_ms=update_ms,
-            title=title,
-            postproc_instance=postproc_instance
-        ).run()
+    postproc_instance = PostProcessing(
+            filename=filename,
+            modulation=modulation,
+            **postproc_params
+    )
+    PlotServer(
+        ip_address=address,
+        port=port,
+        update_ms=update_ms,
+        title=title,
+        postproc_instance=postproc_instance
+    ).run()
 
 
 def run_all_experiments(get_experiment_fcn, address='127.0.0.1', start_port=8888, update_ms=1000):
@@ -191,8 +186,6 @@ def run_all_experiments(get_experiment_fcn, address='127.0.0.1', start_port=8888
 
     postproc_params = sim_params['postprocessing'] if 'postprocessing' in sim_params else {}
     all_experiments = expand_experiment_parameters(sim_params['experiment'])
-    # Enable log for tool-scripts
-    enable_log('simulator_awgn_python.tools')
 
     # Run all requested experiments
     server_processes = []
@@ -200,7 +193,7 @@ def run_all_experiments(get_experiment_fcn, address='127.0.0.1', start_port=8888
     # Run all experiments
     for i, exp_params in enumerate(all_experiments):
         exp_instance = get_experiment_fcn(**exp_params)
-        print(f'Data: {exp_instance.get_filename()}\nURL: http://{address}:{start_port + i}')
+        print(f'Data: {exp_instance.get_filename()}')
         server_start_fcn = partial(
             run_plot_server,
             address=address,
@@ -213,6 +206,7 @@ def run_all_experiments(get_experiment_fcn, address='127.0.0.1', start_port=8888
             target=server_start_fcn,
             args=(exp_instance.get_filename(), exp_instance.modulation)
         )
+        print('Starting plot server...')
         plot_process.start()
         server_processes.append(plot_process)
         simulate(exp_instance, **sim_params['simulation'])
