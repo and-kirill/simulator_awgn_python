@@ -19,6 +19,7 @@ This module implements parallelization utils
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 import multiprocessing
+import multiprocessing.pool as mp_pool
 import sys
 import signal
 import logging
@@ -74,11 +75,49 @@ def init_pool(worker_contexts):
 
     try:
         yield pool
-    finally:
-        LOGGER.critical('Closing the pool. If stuck after Ctrl+C, press Ctrl+C again.')
-        pool.terminate()
-        pool.join()
+    except BaseException:
+        LOGGER.warning('Aborting the pool.')
+        _abort_pool(pool)
+        raise
+    else:
+        LOGGER.info('Closing the pool.')
+        try:
+            pool.close()
+            pool.join()
+        except BaseException:
+            LOGGER.warning('Aborting the pool during shutdown.')
+            _abort_pool(pool)
+            raise
         LOGGER.info('Pool closed.')
+
+
+def _abort_pool(pool):
+    """
+    Stop the pool without relying on multiprocessing.Pool.terminate().
+
+    On Linux, Pool.terminate() can block while its helper threads drain the
+    task queue. Avoid that path: stop the helper threads, send SIGTERM directly
+    to the workers, and cancel the pool finalizer so interpreter shutdown does
+    not wait for the pool again.
+    """
+    pool._state = mp_pool.TERMINATE
+    pool._worker_handler._state = mp_pool.TERMINATE
+    pool._task_handler._state = mp_pool.TERMINATE
+    pool._result_handler._state = mp_pool.TERMINATE
+
+    workers = list(pool._pool)
+    for worker in workers:
+        if worker.is_alive():
+            worker.terminate()
+    for worker in workers:
+        worker.join(timeout=2)
+    for worker in workers:
+        if worker.is_alive():
+            LOGGER.error('Worker %s did not stop after SIGTERM.', worker.pid)
+
+    # The finalizer would call Pool._terminate_pool() again at interpreter
+    # shutdown; workers are already gone, so cancel it.
+    pool._terminate.cancel()
 
 
 # Below are worker-related methods (All methods are static to avoid serialization)
@@ -104,9 +143,12 @@ def sighandler(_, __):
 def init_worker(worker_queue):
     """
     Initialize pool worker with its independent RNG and optional experiment
-    data (for example a GPU index).
+    data (for example a device index).
     """
     signal.signal(signal.SIGINT, sighandler)
+    # The parent converts SIGTERM into a cleanup exception. Workers must keep
+    # the default behavior so pool.terminate() actually stops them.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     try:
         worker_context = worker_queue.get()

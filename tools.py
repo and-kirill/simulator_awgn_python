@@ -22,27 +22,63 @@ import os
 import sys
 import pickle
 import json
+import signal
+import threading
 import numpy as np
 
+from contextlib import contextmanager
 from filelock import FileLock
+
+
+@contextmanager
+def _defer_shutdown_signals():
+    """
+    Defer SIGINT/SIGTERM while a file lock is held.
+
+    Otherwise an interrupt can arrive between acquiring and releasing the lock,
+    leaving the process waiting for a lock it already owns during cleanup.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    signals = (signal.SIGINT, signal.SIGTERM)
+    previous = {sig: signal.getsignal(sig) for sig in signals}
+    deferred = []
+
+    def defer(signum, _):
+        deferred.append(signum)
+
+    for sig in signals:
+        signal.signal(sig, defer)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        # Re-deliver the first deferred signal with its original handler.
+        if deferred:
+            signal.raise_signal(deferred[0])
 
 
 def load_pickle(filename):
     """
     Load pickle file using file lock
     """
-    with FileLock(filename + '.lock'):
-        with open(filename, 'rb') as file_handle:
-            return pickle.load(file_handle)
+    with _defer_shutdown_signals():
+        with FileLock(filename + '.lock'):
+            with open(filename, 'rb') as file_handle:
+                return pickle.load(file_handle)
 
 
 def save_pickle(filename, data):
     """
     Save pickle using file lock
     """
-    with FileLock(filename + '.lock'):
-        with open(filename, 'wb') as file_handle:
-            pickle.dump(data, file_handle, 2)
+    with _defer_shutdown_signals():
+        with FileLock(filename + '.lock'):
+            with open(filename, 'wb') as file_handle:
+                pickle.dump(data, file_handle, 2)
 
 
 def load_json(config_file):

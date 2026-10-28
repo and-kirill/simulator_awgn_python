@@ -84,11 +84,32 @@ class SimulatorApp:
 
     def run(self):
         """
-        Main function to run all experiments
+        Main function to run all experiments.
+
+        The plot processes are always stopped and the text output is always
+        written, including on Ctrl+C, SIGTERM, and unexpected exceptions.
         """
-        while self.settings.remaining():
-            self.__run_experiment()
-        self.__terminate()
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, self.__raise_keyboard_interrupt)
+        try:
+            while self.settings.remaining():
+                self.__run_experiment()
+            self.__terminate()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                self.__stop_plot_servers()
+                self.__write_txt()
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+
+    @staticmethod
+    def __raise_keyboard_interrupt(_, __):
+        """
+        Convert SIGTERM into the same cleanup path as Ctrl+C.
+        """
+        raise KeyboardInterrupt
 
     def __run_experiment(self):
         """
@@ -99,8 +120,10 @@ class SimulatorApp:
         storage = self.__connect_storage(exp_params.filename)
         # Start live plotting
         self.__start_live_postprocessing(vis_params, exp_params)
-        self.__run_main_loop(exp_params, storage)
-        self.__stop_live_postprocessing()
+        try:
+            self.__run_main_loop(exp_params, storage)
+        finally:
+            self.__stop_live_postprocessing()
 
     def __connect_storage(self, filename):
         """
@@ -134,7 +157,8 @@ class SimulatorApp:
                 partial(do_simulate_awgn_fec, storage=storage, exp_settings=exp_params)
             )
         except KeyboardInterrupt:
-            print('Simulation interrupted by user. Will proceed to the next experiment (if any).')
+            print('Simulation interrupted by user. Stopping experiment.')
+            raise
         except ValueError as exc:
             print('Simulation failed.', exc)
             self.__stop_plot_servers()
@@ -156,9 +180,17 @@ class SimulatorApp:
             return
         plot_process = mp.Process(
             target=run_plot_server,
-            args=(postproc_instance, vis_params, exp_params)
+            args=(postproc_instance, vis_params, exp_params),
+            daemon=True
         )
-        plot_process.start()
+        # Fork must not inherit the parent's SIGTERM->KeyboardInterrupt handler:
+        # terminate() should stop the plot server immediately.
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        try:
+            plot_process.start()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         self.plot_processes.append(plot_process)
 
     def __stop_live_postprocessing(self):
@@ -186,29 +218,30 @@ class SimulatorApp:
 
     def __stop_plot_servers(self):
         """
-        Terminate all plot server processes
+        Terminate all plot server processes and wait until they are gone.
         """
-        for plot_process in self.plot_processes:
-            plot_process.terminate()
-            plot_process.join()
+        processes = self.plot_processes
         self.plot_processes = []
+        for plot_process in processes:
+            if plot_process.is_alive():
+                plot_process.terminate()
+        for plot_process in processes:
+            plot_process.join(timeout=5)
+            if plot_process.is_alive():
+                plot_process.kill()
+                plot_process.join()
 
     def __terminate(self):
         """
-        Terminate simulations: save data and stop plot servers
-        if option 'stop_plots=no' has been selected, then
-        plot servers will run until interrupted by user.
+        Wait for Ctrl+C before stopping persistent plot servers.
+        If option 'stop_plots=no' has been selected, plot servers run until
+        interrupted by user. Cleanup itself is handled by run().
         """
         if not self.args.run_plots:
             return
         # When all experiments are complete, plot server will continue working
         if not self.args.stop_plots:
             wait_for_ctrlc()
-
-        # Keyboard interrupt can be captured by plot-server only
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        self.__stop_plot_servers()
-        self.__write_txt()
 
 
 def do_simulate_awgn_fec(pool, storage, exp_settings, batch_size=1):
@@ -290,8 +323,10 @@ def run_plot_server(postproc_instance, vis_settings, exp_settings):
     """
     Target-function for live-plot server. Redirect stdout to log file
     """
-    # Redirect flask stdout to file
+    # Redirect flask stdout to file. The parent stops this process with
+    # terminate() (SIGTERM), so keep the default SIGTERM behavior here.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     with open(vis_settings.log_file, 'a', encoding='utf-8') as sys.stdout:
         PlotServer(
             exp_settings.title,

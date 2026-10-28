@@ -53,19 +53,8 @@ Optional:
 
 - `batch_size` property — number of trials per task. For codec-based
   experiments it forwards `self.codec.batch_size`; every codec exposes it and
-  defaults to `1`. This value is owned by the codec and is not specified in the
-  simulation JSON. It belongs to `experiment.codec`:
-
-  ```json
-  {
-    "experiment": {
-      "codec": {
-        "type": "NbLdpcCudaSoftCodec",
-        "batch_size": 50000
-      }
-    }
-  }
-  ```
+  defaults to `1`. This value is owned by the codec and is configured inside
+  `experiment.codec`, not in `simulation`.
 
 - `run(snr_db)` — single-trial helper, normally used inside `run_batch()`.
 
@@ -82,14 +71,15 @@ means. The standard helper is
 @dataclasses.dataclass
 class WorkerContext:
     seed: object          # RNG seed sequence
-    data: object = None   # experiment-specific payload (e.g. GPU index)
+    data: object = None   # experiment-specific payload (e.g. device index)
 
     def get_seed_sequence(self): ...
     def get_rng(self): ...
 ```
 
-The demo uses `WorkerContext` with `data=None`. A CUDA experiment stores a GPU
-index in `data`. An experiment may use its own context type instead.
+The demo uses `WorkerContext` with `data=None`. An experiment with per-worker
+devices can store a device index in `data`. An experiment may use its own
+context type instead.
 
 The scheduler-level `n_tasks` is the number of independent tasks submitted to
 the process pool. `batch_size` is the number of trials in one task and is
@@ -162,6 +152,10 @@ The code is assumed to be used as a module. To run demo experiment, proceed thro
 ```console
 python3 -m simulator_awgn_python.demo -c demo.json --no-run-plots
 ```
+
+Ctrl+C aborts the worker pool immediately, stops live-plot server processes,
+and writes the text output before exiting. After the simulation finishes,
+plot servers stay alive until Ctrl+C unless `--stop-plots` is specified.
 
 ## Requirements
 See [requirements.txt](requirements.txt)
