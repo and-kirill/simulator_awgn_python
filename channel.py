@@ -272,3 +272,18 @@ def random_bits(bits_placeholder, rng):
     """
     bits_placeholder[:] = rng.integers(
         2, size=bits_placeholder.shape, dtype=np.uint8)
+
+
+def output_ber(llr, tx_bits):
+    """Fraction of hard decisions that differ from transmitted bits.
+
+    A negative LLR is interpreted as bit 1; LLR == 0 is counted as an error.
+    """
+    llr = np.asarray(llr)
+    tx_bits = np.asarray(tx_bits)
+    if llr.shape != tx_bits.shape:
+        raise ValueError('LLR and transmitted bits must have the same shape')
+    if llr.size == 0:
+        raise ValueError('Empty LLR vector')
+    errors = (llr == 0) | ((llr < 0) != tx_bits)
+    return float(np.count_nonzero(errors) / llr.size)

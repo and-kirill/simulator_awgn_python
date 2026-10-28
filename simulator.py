@@ -32,7 +32,7 @@ from rich import print
 from .postprocessing import PostProcessing
 from .live_plot import PlotServer
 from .settings import Settings
-from .parallel import main_loop, schedule_batch
+from .parallel import main_loop, schedule_tasks
 from .data_storage import DataStorage, DataEntry
 from .bitrate import BitratePrinter
 
@@ -211,15 +211,17 @@ class SimulatorApp:
         self.__write_txt()
 
 
-def do_simulate_awgn_fec(pool, storage, exp_settings):
+def do_simulate_awgn_fec(pool, storage, exp_settings, batch_size=1):
     """
     Main loop function consists of schedule-collect chain, with a maximum number
-    of simultaneously scheduled tasks not exeeding 'look_ahead' parameter
+    of simultaneously scheduled tasks not exeeding 'look_ahead' parameter.
+    batch_size is the codec-defined experiment batch size (default 1).
     """
+    storage.set_batch_size(batch_size)
     task_queue = []
-    bitrate_printer = BitratePrinter(storage.sim_settings, exp_settings)
+    bitrate_printer = BitratePrinter(
+        storage.sim_settings, exp_settings, batch_size)
     look_ahead = storage.sim_settings.look_ahead  # Maximum tasks that can be scheduled
-    chunk_size = storage.sim_settings.chunk_size  # The number of tasks per-single-run
     while not storage.is_simulation_complete():
         # Collect data (if the number of scheduled task reached maximum):
         if len(task_queue) > look_ahead or storage.get_pending_count() == 0:
@@ -229,8 +231,8 @@ def do_simulate_awgn_fec(pool, storage, exp_settings):
             storage.update(batch_data, got_snr_db)
         # Schedule data:
         if storage.get_pending_count():  # May change afer storage.update()
-            scheduled_snr_db, batch_size = storage.request_batch()
-            async_result = schedule_batch(scheduled_snr_db, int(batch_size), chunk_size, pool)
+            scheduled_snr_db, n_tasks = storage.request_batch()
+            async_result = schedule_tasks(scheduled_snr_db, int(n_tasks), batch_size, pool)
             task_queue.append((scheduled_snr_db, async_result))
     # Reset bit-rate printing
     bitrate_printer.stop()

@@ -76,12 +76,8 @@ class SimulationSettings:
     # the simulator will evaluate new points and how much statistics will be collected
     # before the simulator will include the next SNR point in the scheduling list
     errors_per_batch: float = 10
-    # To reduce inter-process communication overhead, each task may consist of several
-    # decoding attempts. Use this parameter to set this number of attempts.
-    chunk_size: int = 1
-    # Maximum batch size. Avoid extremely large batches to reduce memory consumption of
-    # master process
-    max_batch_size: int = int(1e6)
+    # Maximum number of tasks in one scheduler request.
+    max_tasks: int = int(1e6)
     # Specify the number of workers manually. For long codes, smaller number of workers may
     # result in higher simulated bit-rate due to CPU cache issues
     n_workers: int = multiprocessing.cpu_count()
@@ -92,15 +88,15 @@ class SimulationSettings:
     bitrate_smooth_time: float = 120.0
     bitrate_print_period: float = 1.0
 
-    def get_batch_size(self, p_error, n_experiments):
+    def get_n_tasks(self, p_error, n_experiments, batch_size):
         """
-        Get batch size in accordance with the probability of error and
-        the number of conducted experiments.
+        Get the number of tasks in accordance with the probability of error,
+        the number of conducted experiments, and the experiment batch size.
         """
         n_tests = self.errors_per_batch / p_error
         n_remaining = max(self.max_experiments + 1 - n_experiments, 0)
         n_remaining = min(n_tests, n_remaining)
-        return int(np.ceil(n_remaining / self.chunk_size))
+        return int(np.ceil(n_remaining / batch_size))
 
     def __post_init__(self):
         """
@@ -113,8 +109,6 @@ class SimulationSettings:
             raise ValueError('SNR step is below SNR precision.')
         if self.snr_precision < 0 or self.snr_precision > 15:
             raise ValueError(f'Invalid value for SNR precision: {self.snr_precision}')
-        if self.chunk_size < 1:
-            raise ValueError('Chunk size must be a positive integer')
         if self.max_errors < 0:
             raise ValueError('Maximum number of errors must be a positive number')
         if self.min_error_prob <= 0 or self.min_error_prob >= 1:
@@ -136,8 +130,7 @@ class SimulationSettings:
         msg += f'MIN probability of error:      {self.min_error_prob:1.4e}\n'
         msg += f'Scheduler \'look ahead\':        {self.look_ahead} SNR points\n'
         msg += f'Target num. of errors / batch: {self.errors_per_batch:1.3f}\n'
-        msg += f'Chunk size:                    {self.chunk_size}\n'
-        msg += f'Maximum batch size:            {self.max_batch_size}\n'
+        msg += f'Maximum number of tasks:       {self.max_tasks}\n'
         msg += f'The number of workers:         {self.n_workers}\n'
         msg += f'Simulation log file:          \'{self.log_file}\''
         return msg

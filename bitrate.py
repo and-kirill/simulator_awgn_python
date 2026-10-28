@@ -26,7 +26,7 @@ class BitratePrinter:
     """
     EWMA-filtered simulated bit-rate printer
     """
-    def __init__(self, sim_settings, exp_settings):
+    def __init__(self, sim_settings, exp_settings, batch_size):
         self.last_update = time.time()
         self.last_print = 0
         self.bitrate = 0
@@ -34,6 +34,7 @@ class BitratePrinter:
 
         self.sim_settings = sim_settings
         self.exp_settings = exp_settings
+        self.batch_size = batch_size
 
     def print(self, n_tasks):
         """
@@ -46,8 +47,8 @@ class BitratePrinter:
         """
         Derive instantaneous and save smooth bit-rate
         """
-        # Take chunk size into acocunt when calculating the number of tasks
-        tot_tsasks = n_tasks * self.sim_settings.chunk_size
+        # Take the codec-defined batch size into account
+        tot_tsasks = n_tasks * self.batch_size
         # Calculate instantaneous simulated bitrate
         got_thr = tot_tsasks * self.exp_settings.inf_bits_count / (time.time() - self.last_update)
 

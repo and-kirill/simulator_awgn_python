@@ -20,6 +20,87 @@ The following plots are available:
 
 These outputs are saved to the text file that can further be captured by latex (See corresponding [standalone tex-file](berfit_plot.tex))
 
+## Experiment contract
+
+The simulator runner takes two types: an **experiment settings** type and an
+**experiment instance** type. The worker context is not a third top-level type:
+it is an opaque object created by the experiment and passed to its workers.
+
+### 1. Settings
+
+Settings are constructed from the `experiment` section of the JSON file. They
+must expose:
+
+- `title` — live-plot title;
+- `filename` — pickle output filename;
+- `inf_bits_count` — information bits per frame, used for bit-rate estimates.
+
+`__str__()` is optional and used for logging.
+
+### 2. Instance
+
+The instance is constructed from the settings before the pool is forked. It
+must implement:
+
+- `prepare_workers(n_workers)` — return a sequence of per-worker contexts
+  before fork. Its length becomes the actual number of workers.
+- `init_worker(context)` — called once in every worker after fork. The
+  instance stores the context and prepares per-worker resources.
+- `run_batch(snr_db, batch_size)` — the only worker entry point. It must run
+  `batch_size` trials and return a `DataEntry`-compatible result.
+
+Optional:
+
+- `batch_size` property — number of trials per task. For codec-based
+  experiments it forwards `self.codec.batch_size`; every codec exposes it and
+  defaults to `1`. This value is owned by the codec and is not specified in the
+  simulation JSON. It belongs to `experiment.codec`:
+
+  ```json
+  {
+    "experiment": {
+      "codec": {
+        "type": "NbLdpcCudaSoftCodec",
+        "batch_size": 50000
+      }
+    }
+  }
+  ```
+
+- `run(snr_db)` — single-trial helper, normally used inside `run_batch()`.
+
+If `prepare_workers` is absent, returns `None`, or `init_worker` is absent, the
+simulation fails; there is no silent fallback context.
+
+### 3. Worker context
+
+The simulator treats the context as opaque. The experiment defines what it
+means. The standard helper is
+`simulator_awgn_python.worker.WorkerContext`:
+
+```python
+@dataclasses.dataclass
+class WorkerContext:
+    seed: object          # RNG seed sequence
+    data: object = None   # experiment-specific payload (e.g. GPU index)
+
+    def get_seed_sequence(self): ...
+    def get_rng(self): ...
+```
+
+The demo uses `WorkerContext` with `data=None`. A CUDA experiment stores a GPU
+index in `data`. An experiment may use its own context type instead.
+
+The scheduler-level `n_tasks` is the number of independent tasks submitted to
+the process pool. `batch_size` is the number of trials in one task and is
+taken from the experiment's `batch_size` property, then passed to
+`run_batch()`.
+
+`DemoExperimentInstance` is the reference implementation: it implements
+`prepare_workers`, `init_worker` and `run_batch`, and uses a plain Python loop
+for its cheap trials. `WorkerContext` belongs to the simulator utility layer,
+not to the demo: the demo only demonstrates how to use it.
+
 ## Usage
 The code is assumed to be used as a module. To run demo experiment, proceed through the following steps:
 
@@ -34,8 +115,8 @@ The code is assumed to be used as a module. To run demo experiment, proceed thro
     - `max_errors` is a maximum number of errors to be collected. If the specified number of errors has happened, simulator stops evaluating the corresponding SNR point and proceeds to the next one.
     - `max_experiments` is a maximum number of experiments to conduct. If this number is hit before the condition above, simulator will proceed to the next SNR point
     - `min_error_prob` is a minimum probability of error to be simulated. If (after the conditions above satisfied) the probability of error goes below the specified value, simulation stops. Simulator assumes that the probability of error decreases with the SNR increase, and it iterates through the sorted SNR values. Note that some requested SNR points may not be evaluated.
-    - `chunk_size` is the number of single tests to be performed by a worker at once. If not specified, default value is one. If the batch size is too large, data merging may become a bottleneck. This may happen when trying to evaluate very small probability of errors. To improve simulation efficiency, try increasing this parameter.
-    - `look_ahead` allows to schedule multiple batches simultaneously to optimize the CPU usage.
+    - `look_ahead` allows scheduling multiple tasks simultaneously to optimize pool utilization.
+    - `max_tasks` limits the number of independent tasks in one scheduler request.
   - To configure postprocessing, specify the following parameters:
     - `confidence_level` is a confidence level for error-bars
     - `pe_threshold` is a maximum probability of error to be included in the regression model (values close to one may result in numerical instability)
@@ -51,11 +132,15 @@ The code is assumed to be used as a module. To run demo experiment, proceed thro
     "modulation": "qpsk"
   },
   "simulation": {
-    "snr_range": "-5:0.01:10",
+    "n_workers": 4,
+    "snr_range": "-5:0.5:10",
     "max_errors": 50,
-    "max_experiments": 1e7,
+    "max_experiments": 100000,
     "min_error_prob": 1e-4,
-    "snr_precision": 3
+    "max_tasks": 1000,
+    "look_ahead": 2,
+    "snr_precision": 3,
+    "log_file": "demo_log.log"
   },
   "postprocessing": {
     "confidence_level": 0.95,
@@ -75,7 +160,7 @@ The code is assumed to be used as a module. To run demo experiment, proceed thro
 
 * Run the simulation script (not from the module directory)
 ```console
-python3 -m simulator_awgn_python.demo --config=<json_file>.json
+python3 -m simulator_awgn_python.demo -c demo.json --no-run-plots
 ```
 
 ## Requirements

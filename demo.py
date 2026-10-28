@@ -23,6 +23,8 @@ import dataclasses
 import numpy as np
 
 from .data_storage import DataEntry
+from .tools import dataclass_merge
+from .worker import WorkerContext
 from .channel import AwgnQAMChannel, output_ber, random_bits, lib_compile
 from .simulator import run_all_experiments
 
@@ -93,13 +95,20 @@ class DemoExperimentInstance:
         # Channel adapter is not required for randomly-generated codewords
         self.channel = AwgnQAMChannel(self.settings.modulation, self.tx_bits, self.llr, False)
 
-    def run(self, snr_db, rng):
+    def prepare_workers(self, n_workers):
+        return WorkerContext.spawn(n_workers)
+
+    def init_worker(self, context):
+        self.context = context
+
+    def run(self, snr_db):
         """
         This method implements a single test
         :param snr_db: signal-to-noise ratio (dB)
         :param rng: Random number generator instance
         :return: DataEntry with results of single tet
         """
+        rng = self.context.get_rng()
         random_bits(self.tx_bits, rng)
         in_ber, in_ser = self.channel.run(snr_db, rng)
         cwd_hat = self.llr < 0
@@ -114,6 +123,16 @@ class DemoExperimentInstance:
             fe_cum=out_ber > 0,
             tests=1
         )
+
+
+    def run_batch(self, snr_db, batch_size):
+        """
+        Batch entry point for the simulator. The demo is cheap, so a plain
+        loop is sufficient here; a vectorized experiment overrides this with
+        its own batched implementation.
+        """
+        data = [self.run(snr_db) for _ in range(batch_size)]
+        return dataclass_merge(None, data)
 
 
 if __name__ == '__main__':

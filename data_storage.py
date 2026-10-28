@@ -95,7 +95,7 @@ class DataStorage:
         """
         Scheduling entry. Tracks the state of each SNR point
         """
-        def __init__(self, settings, n_errors, n_tests):
+        def __init__(self, settings, n_errors, n_tests, batch_size):
             """
             Initialize the scheduling entry using simulation settings and corresponding data entry
             """
@@ -108,10 +108,11 @@ class DataStorage:
             # Batch size (estimated in accordance with probability of error)
             if n_errors > 0:
                 # Set batch size in accordance wirh errors-per-batch
-                self.batch_size = settings.get_batch_size(p_error, n_tests)
+                self.n_tasks = settings.get_n_tasks(
+                    p_error, n_tests, batch_size)
             else:
                 # Otherwise, exponentially increase the batch size to load pool
-                self.batch_size = n_tests + 1
+                self.n_tasks = n_tests + 1
 
         @staticmethod
         def get_initial_state(settings, n_errors, n_tests):
@@ -152,6 +153,8 @@ class DataStorage:
         # The parameters below must be set by simulator
         self.sim_settings = sim_settings
         self.filename = filename
+        # Codec-defined number of trials per task. It is set before scheduling.
+        self.batch_size = 1
 
         # Initialize data entries
         self.d_entries = {}
@@ -166,7 +169,22 @@ class DataStorage:
         # Initialize scheduling entries
         self.s_entries = [self.init_s_entry(snr_db) for snr_db in self.sim_settings.snr_array]
 
-        self.__update_batch_size()
+        self.__update_n_tasks()
+        self.__update_pending()
+
+    def set_batch_size(self, batch_size):
+        """
+        Set the codec-defined number of trials per task and rebuild the
+        scheduling state accordingly.
+        """
+        if batch_size < 1:
+            raise ValueError('Batch size must be a positive integer')
+        self.batch_size = batch_size
+        self.s_entries = [
+            self.init_s_entry(snr_db)
+            for snr_db in self.sim_settings.snr_array
+        ]
+        self.__update_n_tasks()
         self.__update_pending()
 
     def update(self, results, snr_db):
@@ -193,7 +211,7 @@ class DataStorage:
         self.s_entries[snr_index] = self.init_s_entry(snr_db)
 
         # Re-estimate batch sizes and scheduling entries states
-        self.__update_batch_size()
+        self.__update_n_tasks()
         self.__update_pending()
 
     def is_simulation_complete(self):
@@ -215,19 +233,19 @@ class DataStorage:
         id_schedule = idx_pending[np.argmin(error_count[idx_pending])]
         self.s_entries[id_schedule].scheduled()
         snr_db = self.sim_settings.snr_array[id_schedule]
-        batch_size = int(self.s_entries[id_schedule].batch_size)
-        batch_size = min(batch_size, self.sim_settings.max_batch_size)
+        n_tasks = int(self.s_entries[id_schedule].n_tasks)
+        n_tasks = min(n_tasks, self.sim_settings.max_tasks)
 
         # Log request event:
         LOGGER.info(
             'Scheduled %s. Batch size %1.4e (%1.4e X %1.4e)',
             snr_db_str(snr_db, self.sim_settings.snr_precision),
-            batch_size * self.sim_settings.chunk_size,
-            batch_size,
-            self.sim_settings.chunk_size
+            n_tasks * self.batch_size,
+            n_tasks,
+            self.batch_size
         )
 
-        return snr_db, batch_size
+        return snr_db, n_tasks
 
     def get_pending_count(self):
         """
@@ -267,19 +285,22 @@ class DataStorage:
         Initialize the scheduling entry given the snr point
         """
         if snr_db not in self.d_entries:
-            return DataStorage.SchedulingEntry(self.sim_settings, 0, 0)
+            return DataStorage.SchedulingEntry(
+                self.sim_settings, 0, 0, self.batch_size)
         d_entry = self.d_entries[snr_db]
-        return DataStorage.SchedulingEntry(self.sim_settings, d_entry.fe_cum, d_entry.tests)
+        return DataStorage.SchedulingEntry(
+            self.sim_settings, d_entry.fe_cum, d_entry.tests,
+            self.batch_size)
 
-    def __update_batch_size(self):
+    def __update_n_tasks(self):
         """
-        Batch sizes is a non-decreasing sequence.
-        Set batch size as a maximum among all previous values and a current vlaue
+        The number of tasks is a non-decreasing sequence. Set it to the maximum
+        among all previous values and the current value.
         """
-        max_batch_size = 0
+        max_n_tasks = 0
         for i, _ in enumerate(self.sim_settings.snr_array):
-            max_batch_size = max(self.s_entries[i].batch_size, max_batch_size)
-            self.s_entries[i].batch_size = max_batch_size
+            max_n_tasks = max(self.s_entries[i].n_tasks, max_n_tasks)
+            self.s_entries[i].n_tasks = max_n_tasks
 
     def __update_pending(self):
         """

@@ -23,57 +23,53 @@ import sys
 import signal
 import logging
 from contextlib import contextmanager
-from numpy.random import SeedSequence, default_rng
-
-from .tools import dataclass_merge
-
-# A global random state to be used in different processes of the multiprocessing pool
-__RNG_INSTANCE = None
-# Global per-process experiment instance created by pool init function
-__EXP_INSTANCE = None
-
 
 LOGGER = logging.getLogger(__name__)
 
 
 def main_loop(experiment_type, experiment_settings, n_workers, mainloop_fcn):
     """
-    Wrapper for main-loop simulation function
+    Wrapper for main-loop simulation function.
     """
     # Instantiate experiment before making fork.
     # This will leverage copy-on-write memory management
     global __EXP_INSTANCE
     __EXP_INSTANCE = experiment_type(experiment_settings)
-    with init_pool(n_workers) as pool:
-        mainloop_fcn(pool)
+
+    worker_contexts = __EXP_INSTANCE.prepare_workers(n_workers)
+    n_workers = len(worker_contexts)
+
+    batch_size = getattr(__EXP_INSTANCE, 'batch_size', 1)
+    with init_pool(worker_contexts) as pool:
+        mainloop_fcn(pool, batch_size=batch_size)
 
 
-def schedule_batch(snr_db, batch_size, chunk_size, pool):
+def schedule_tasks(snr_db, n_tasks, batch_size, pool):
     """
-    Run single batch for given SNR value. Return multiprocessing async result
+    Schedule n_tasks independent tasks; each task runs batch_size trials.
     """
     return pool.map_async(
         single_run,
-        [(snr_db, chunk_size)] * batch_size
+        [(snr_db, batch_size)] * n_tasks
     )
 
 
 @contextmanager
-def init_pool(n_workers):
+def init_pool(worker_contexts):
     """
-    Initialize the parallel pool
+    Initialize the parallel pool from per-worker WorkerContext entries.
     """
+    n_workers = len(worker_contexts)
     LOGGER.info('Initializing pool of %d workers.', n_workers)
     # Use 'fork' to leverage copy-on-write memory management
     ctx = multiprocessing.get_context('fork')
-    # Initialize the seed sequence for child processes:
-    rng_queue = ctx.Queue()
-    for rng in SeedSequence().spawn(n_workers):
-        rng_queue.put(rng)
+    worker_queue = ctx.Queue()
+    for context in worker_contexts:
+        worker_queue.put(context)
     pool = ctx.Pool(
         processes=n_workers,
         initializer=init_worker,
-        initargs=(rng_queue,)
+        initargs=(worker_queue,)
     )
 
     try:
@@ -92,13 +88,8 @@ def single_run(args):
     In the case of crash, stacktrace will be written to file
     :param args: required arguments tuple
     """
-    snr_db, chunk_size = args
-    # Use per-process global random state and experiment instance here (see init_pool)
-    entry = __EXP_INSTANCE.run(snr_db, __RNG_INSTANCE)
-    if chunk_size > 1:
-        data = [__EXP_INSTANCE.run(snr_db, __RNG_INSTANCE) for _ in range(chunk_size - 1)]
-        entry = dataclass_merge(entry, data)
-    return entry
+    snr_db, batch_size = args
+    return __EXP_INSTANCE.run_batch(snr_db, batch_size)
 
 
 def sighandler(_, __):
@@ -110,23 +101,20 @@ def sighandler(_, __):
     sys.exit(1)
 
 
-def init_worker(rng_queue):
+def init_worker(worker_queue):
     """
-    Initialize pool worker
-    :param rng_queue: Multiprocessing queue with seed list
-    :param experiment_type: Experiment class type
-    :param experiment_settings: Experiment config instance
-    :return: None, just updates all global per-process variables
+    Initialize pool worker with its independent RNG and optional experiment
+    data (for example a GPU index).
     """
     signal.signal(signal.SIGINT, sighandler)
 
-    # Initialize random number generator instance:
-    global __RNG_INSTANCE
     try:
-        __RNG_INSTANCE = default_rng(rng_queue.get())
-        rng_queue.close()
+        worker_context = worker_queue.get()
+        worker_queue.close()
     except OSError:
-        # If some worker pool_crashed, multiprocessing.Pool() will try to re-initialize a worker
-        # This re-created worker will not be able to get a proper seed value
-        # Silently exit in this case
+        # If some worker pool_crashed, multiprocessing.Pool() will try to
+        # re-initialize a worker. It cannot receive a proper context in this case.
         sys.exit(1)
+
+    # The experiment owns worker-context semantics.
+    __EXP_INSTANCE.init_worker(worker_context)
