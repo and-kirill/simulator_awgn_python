@@ -107,12 +107,16 @@ class DataStorage:
             self.error_count = n_errors
             # Batch size (estimated in accordance with probability of error)
             if n_errors > 0:
-                # Set batch size in accordance wirh errors-per-batch
+                # Set the number of tasks in accordance with errors-per-batch.
+                # get_n_tasks() converts the requested number of trials to
+                # tasks using the codec batch size.
                 self.n_tasks = settings.get_n_tasks(
                     p_error, n_tests, batch_size)
             else:
-                # Otherwise, exponentially increase the batch size to load pool
-                self.n_tasks = n_tests + 1
+                # No errors observed yet: roughly double the number of trials
+                # tried so far. Convert trials to tasks; forgetting this
+                # division makes a batch explode when batch_size > 1.
+                self.n_tasks = int(np.ceil((n_tests + 1) / batch_size))
 
         @staticmethod
         def get_initial_state(settings, n_errors, n_tests):
